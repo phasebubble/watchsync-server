@@ -19,6 +19,32 @@ function getRoomMembers(room) {
   return Array.from(room.members).map(m => ({ name: m.userName || 'Guest', color: m.userColor || '#a599ff' }));
 }
 
+function getPublicRooms() {
+  return Object.entries(rooms)
+    .filter(([, r]) => r.isPublic)
+    .map(([id, r]) => ({
+      roomId: id,
+      name: r.name || 'Watch Party',
+      site: r.site || 'unknown',
+      count: r.members.size,
+      createdAt: r.createdAt
+    }))
+    .sort((a, b) => b.count - a.count);
+}
+
+function getSiteFromUrl(url) {
+  if (!url) return 'unknown';
+  if (url.includes('netflix'))    return 'netflix';
+  if (url.includes('youtube'))    return 'youtube';
+  if (url.includes('disneyplus')) return 'disney';
+  if (url.includes('max.com'))    return 'max';
+  if (url.includes('hulu'))       return 'hulu';
+  if (url.includes('primevideo')) return 'prime';
+  if (url.includes('paramount'))  return 'paramount';
+  if (url.includes('peacock'))    return 'peacock';
+  return 'other';
+}
+
 wss.on('connection', (ws) => {
   ws.roomId = null;
 
@@ -36,12 +62,15 @@ wss.on('connection', (ws) => {
           host: ws,
           members: new Set([ws]),
           state: { time: 0, playing: false, url: msg.url || null },
-          name: msg.partyName || null
+          name: msg.partyName || 'Watch Party',
+          site: getSiteFromUrl(msg.url),
+          isPublic: msg.isPublic || false,
+          createdAt: Date.now()
         };
         ws.roomId = roomId;
         ws.isHost = true;
         ws.send(JSON.stringify({ action: 'created', roomId }));
-        console.log(`Room created: ${roomId}`);
+        console.log(`Room created: ${roomId} public:${msg.isPublic}`);
         break;
       }
 
@@ -56,6 +85,25 @@ wss.on('connection', (ws) => {
         ws.send(JSON.stringify({ action: 'joined', roomId: msg.roomId, state: room.state, members: getRoomMembers(room) }));
         broadcast(room, { action: 'userJoined', count: room.members.size, members: getRoomMembers(room), name: ws.userName }, ws);
         console.log(`${ws.userName} joined ${msg.roomId}`);
+        break;
+      }
+
+      case 'getLobby': {
+        const query = (msg.query || '').toLowerCase();
+        const site = msg.site || 'all';
+        let results = getPublicRooms();
+        if (query) results = results.filter(r => r.name.toLowerCase().includes(query));
+        if (site !== 'all') results = results.filter(r => r.site === site);
+        ws.send(JSON.stringify({ action: 'lobbyResults', rooms: results.slice(0, 20) }));
+        break;
+      }
+
+      case 'updatePublic': {
+        const room = rooms[ws.roomId];
+        if (!room || !ws.isHost) return;
+        room.isPublic = msg.isPublic;
+        room.name = msg.partyName || room.name;
+        ws.send(JSON.stringify({ action: 'publicUpdated', isPublic: room.isPublic }));
         break;
       }
 
@@ -89,6 +137,7 @@ wss.on('connection', (ws) => {
         room.state.url = msg.url;
         room.state.time = 0;
         room.state.playing = false;
+        room.site = getSiteFromUrl(msg.url);
         broadcast(room, { action: 'navigate', url: msg.url }, ws);
         break;
       }
@@ -108,12 +157,9 @@ wss.on('connection', (ws) => {
       }
 
       case 'resync': {
-        // Guest requests current state from host
         const room = rooms[ws.roomId];
         if (!room) return;
-        ws.send(JSON.stringify({ action: 'seek', time: room.state.time }));
-        if (room.state.playing) ws.send(JSON.stringify({ action: 'play', time: room.state.time }));
-        else ws.send(JSON.stringify({ action: 'pause', time: room.state.time }));
+        ws.send(JSON.stringify({ action: room.state.playing ? 'play' : 'pause', time: room.state.time }));
         break;
       }
     }
@@ -125,12 +171,13 @@ wss.on('connection', (ws) => {
     room.members.delete(ws);
     if (room.members.size === 0) {
       delete rooms[ws.roomId];
+      console.log(`Room deleted: ${ws.roomId}`);
     } else if (ws.isHost) {
       const newHost = room.members.values().next().value;
       newHost.isHost = true;
       room.host = newHost;
       newHost.send(JSON.stringify({ action: 'promoted' }));
-      broadcast(room, { action: 'userLeft', count: room.members.size, members: getRoomMembers(room) }, newHost);
+      broadcast(room, { action: 'userLeft', count: room.members.size, members: getRoomMembers(room), name: ws.userName }, newHost);
     } else {
       broadcast(room, { action: 'userLeft', count: room.members.size, members: getRoomMembers(room), name: ws.userName });
     }
