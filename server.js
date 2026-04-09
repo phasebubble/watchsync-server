@@ -16,19 +16,19 @@ function broadcast(room, message, excludeWs = null) {
 }
 
 function getRoomMembers(room) {
-  return Array.from(room.members).map(m => ({ name: m.userName || 'Guest', color: m.userColor || '#a599ff' }));
+  return Array.from(room.members).map(m => ({
+    name: m.userName || 'Guest',
+    color: m.userColor || '#a599ff',
+    emoji: m.userEmoji || null,
+    level: m.userLevel || null,
+    borderStyle: m.borderStyle || 'default'
+  }));
 }
 
 function getPublicRooms() {
   return Object.entries(rooms)
     .filter(([, r]) => r.isPublic)
-    .map(([id, r]) => ({
-      roomId: id,
-      name: r.name || 'Watch Party',
-      site: r.site || 'unknown',
-      count: r.members.size,
-      createdAt: r.createdAt
-    }))
+    .map(([id, r]) => ({ roomId: id, name: r.name || 'Watch Party', site: r.site || 'unknown', count: r.members.size, createdAt: r.createdAt }))
     .sort((a, b) => b.count - a.count);
 }
 
@@ -56,11 +56,13 @@ wss.on('connection', (ws) => {
 
       case 'create': {
         const roomId = generateRoomId();
-        ws.userName = msg.name || 'Host';
-        ws.userColor = msg.color || '#a599ff';
+        ws.userName    = msg.name || 'Host';
+        ws.userColor   = msg.color || '#a599ff';
+        ws.userEmoji   = msg.emoji || null;
+        ws.userLevel   = msg.level || null;
+        ws.borderStyle = msg.borderStyle || 'default';
         rooms[roomId] = {
-          host: ws,
-          members: new Set([ws]),
+          host: ws, members: new Set([ws]),
           state: { time: 0, playing: false, url: msg.url || null },
           name: msg.partyName || 'Watch Party',
           site: getSiteFromUrl(msg.url),
@@ -70,40 +72,22 @@ wss.on('connection', (ws) => {
         ws.roomId = roomId;
         ws.isHost = true;
         ws.send(JSON.stringify({ action: 'created', roomId }));
-        console.log(`Room created: ${roomId} public:${msg.isPublic}`);
         break;
       }
 
       case 'join': {
         const room = rooms[msg.roomId];
         if (!room) { ws.send(JSON.stringify({ action: 'error', message: 'Room not found' })); return; }
-        ws.userName = msg.name || 'Guest';
-        ws.userColor = msg.color || '#7c6dfa';
+        ws.userName    = msg.name || 'Guest';
+        ws.userColor   = msg.color || '#7c6dfa';
+        ws.userEmoji   = msg.emoji || null;
+        ws.userLevel   = msg.level || null;
+        ws.borderStyle = msg.borderStyle || 'default';
         room.members.add(ws);
         ws.roomId = msg.roomId;
         ws.isHost = false;
         ws.send(JSON.stringify({ action: 'joined', roomId: msg.roomId, state: room.state, members: getRoomMembers(room) }));
         broadcast(room, { action: 'userJoined', count: room.members.size, members: getRoomMembers(room), name: ws.userName }, ws);
-        console.log(`${ws.userName} joined ${msg.roomId}`);
-        break;
-      }
-
-      case 'getLobby': {
-        const query = (msg.query || '').toLowerCase();
-        const site = msg.site || 'all';
-        let results = getPublicRooms();
-        if (query) results = results.filter(r => r.name.toLowerCase().includes(query));
-        if (site !== 'all') results = results.filter(r => r.site === site);
-        ws.send(JSON.stringify({ action: 'lobbyResults', rooms: results.slice(0, 20) }));
-        break;
-      }
-
-      case 'updatePublic': {
-        const room = rooms[ws.roomId];
-        if (!room || !ws.isHost) return;
-        room.isPublic = msg.isPublic;
-        room.name = msg.partyName || room.name;
-        ws.send(JSON.stringify({ action: 'publicUpdated', isPublic: room.isPublic }));
         break;
       }
 
@@ -145,21 +129,46 @@ wss.on('connection', (ws) => {
       case 'chat': {
         const room = rooms[ws.roomId];
         if (!room) return;
-        broadcast(room, { action: 'chat', name: ws.userName, color: ws.userColor, text: msg.text, time: Date.now() }, ws);
+        broadcast(room, { action: 'chat', name: ws.userName, color: ws.userColor, emoji: ws.userEmoji, text: msg.text, time: Date.now() }, ws);
         break;
       }
 
       case 'reaction': {
         const room = rooms[ws.roomId];
         if (!room) return;
-        broadcast(room, { action: 'reaction', emoji: msg.emoji, name: ws.userName }, null);
+        broadcast(room, { action: 'reaction', emoji: msg.emoji, name: ws.userName, isCustom: msg.isCustom || false }, null);
         break;
       }
 
+      // ── RESYNC FIX: send guest the ACTUAL current host state ──────────────
       case 'resync': {
         const room = rooms[ws.roomId];
         if (!room) return;
-        ws.send(JSON.stringify({ action: room.state.playing ? 'play' : 'pause', time: room.state.time }));
+        // Get live time from host if possible, otherwise use stored state
+        ws.send(JSON.stringify({
+          action: 'resyncState',
+          time: room.state.time,
+          playing: room.state.playing
+        }));
+        break;
+      }
+
+      case 'updatePublic': {
+        const room = rooms[ws.roomId];
+        if (!room || !ws.isHost) return;
+        room.isPublic = msg.isPublic;
+        room.name = msg.partyName || room.name;
+        ws.send(JSON.stringify({ action: 'publicUpdated', isPublic: room.isPublic }));
+        break;
+      }
+
+      case 'getLobby': {
+        const query = (msg.query || '').toLowerCase();
+        const site  = msg.site || 'all';
+        let results = getPublicRooms();
+        if (query) results = results.filter(r => r.name.toLowerCase().includes(query));
+        if (site !== 'all') results = results.filter(r => r.site === site);
+        ws.send(JSON.stringify({ action: 'lobbyResults', rooms: results.slice(0, 20) }));
         break;
       }
     }
@@ -171,7 +180,6 @@ wss.on('connection', (ws) => {
     room.members.delete(ws);
     if (room.members.size === 0) {
       delete rooms[ws.roomId];
-      console.log(`Room deleted: ${ws.roomId}`);
     } else if (ws.isHost) {
       const newHost = room.members.values().next().value;
       newHost.isHost = true;
